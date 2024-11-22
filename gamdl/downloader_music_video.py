@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import re
 import subprocess
 import urllib.parse
 from pathlib import Path
 
-import click
 import m3u8
-from tabulate import tabulate
+from InquirerPy import inquirer
+from InquirerPy.base.control import Choice
 
 from .constants import MUSIC_VIDEO_CODEC_MAP
 from .downloader import Downloader
@@ -16,27 +15,30 @@ from .models import StreamInfo
 
 
 class DownloaderMusicVideo:
-    MP4_FORMAT_CODECS = ["hvc1", "ec-3"]
+    MP4_FORMAT_CODECS = ["hvc1", "audio-atmos", "audio-ec3"]
 
     def __init__(
         self,
         downloader: Downloader,
-        codec: MusicVideoCodec = MusicVideoCodec.H264_BEST,
+        codec: MusicVideoCodec = MusicVideoCodec.H264,
     ):
         self.downloader = downloader
         self.codec = codec
 
-    def get_stream_url_master(self, itunes_page: dict) -> str:
-        return itunes_page["offers"][0]["assets"][0]["hlsUrl"]
+    def get_stream_url_from_webplayback(self, webplayback: dict) -> str:
+        return webplayback["hls-playlist-url"]
 
-    def get_m3u8_master_data(self, stream_url_master: str) -> dict:
-        url_parts = urllib.parse.urlparse(stream_url_master)
+    def get_stream_url_from_itunes_page(self, itunes_page: dict) -> dict:
+        stream_url = itunes_page["offers"][0]["assets"][0]["hlsUrl"]
+        url_parts = urllib.parse.urlparse(stream_url)
         query = urllib.parse.parse_qs(url_parts.query, keep_blank_values=True)
         query.update({"aec": "HD", "dsid": "1"})
-        stream_url_master_new = url_parts._replace(
+        return url_parts._replace(
             query=urllib.parse.urlencode(query, doseq=True)
         ).geturl()
-        return m3u8.load(stream_url_master_new).data
+
+    def get_m3u8_master_data(self, stream_url_master: str) -> dict:
+        return m3u8.load(stream_url_master).data
 
     def get_playlist_video(
         self,
@@ -54,7 +56,7 @@ class DownloaderMusicVideo:
                 playlist
                 for playlist in playlists
                 if playlist["stream_info"]["codecs"].startswith(
-                    MUSIC_VIDEO_CODEC_MAP[MusicVideoCodec.H264_BEST]
+                    MUSIC_VIDEO_CODEC_MAP[MusicVideoCodec.H264]
                 )
             ]
         playlists_filtered.sort(key=lambda x: x["stream_info"]["bandwidth"])
@@ -64,24 +66,24 @@ class DownloaderMusicVideo:
         self,
         playlists: list[dict],
     ) -> dict:
-        table = [
-            [
-                i,
-                playlist["stream_info"]["codecs"],
-                playlist["stream_info"]["resolution"],
-                playlist["stream_info"]["bandwidth"],
-            ]
-            for i, playlist in enumerate(playlists, 1)
-        ]
-        print(tabulate(table))
-        try:
-            choice = (
-                click.prompt("Choose a video codec", type=click.IntRange(1, len(table)))
-                - 1
+        choices = [
+            Choice(
+                name=" | ".join(
+                    [
+                        playlist["stream_info"]["codecs"][:4],
+                        playlist["stream_info"]["resolution"],
+                        str(playlist["stream_info"]["bandwidth"]),
+                    ]
+                ),
+                value=playlist,
             )
-        except click.exceptions.Abort:
-            raise KeyboardInterrupt()
-        return playlists[choice]
+            for playlist in playlists
+        ]
+        selected = inquirer.select(
+            message="Select which video codec to download: (Codec | Resolution | Bitrate)",
+            choices=choices,
+        ).execute()
+        return selected
 
     def get_playlist_audio(
         self,
@@ -101,24 +103,19 @@ class DownloaderMusicVideo:
         self,
         playlists: list[dict],
     ) -> dict:
-        table = [
-            [
-                i,
-                playlist["group_id"],
-            ]
-            for i, playlist in enumerate(playlists, 1)
-        ]
-        print(tabulate(table))
-        try:
-            choice = (
-                click.prompt(
-                    "Choose an audio codec", type=click.IntRange(1, len(table))
-                )
-                - 1
+        choices = [
+            Choice(
+                name=playlist["group_id"],
+                value=playlist,
             )
-        except click.exceptions.Abort:
-            raise KeyboardInterrupt()
-        return playlists[choice]
+            for playlist in playlists
+            if playlist.get("uri")
+        ]
+        selected = inquirer.select(
+            message="Select which audio codec to download:",
+            choices=choices,
+        ).execute()
+        return selected
 
     def get_pssh(self, m3u8_data: dict):
         return next(
@@ -149,9 +146,7 @@ class DownloaderMusicVideo:
         else:
             playlist = self.get_playlist_audio_from_user(m3u8_master_data["media"])
         stream_info.stream_url = playlist["uri"]
-        stream_info.codec = re.search(r"_([^_]+)\.m3u8", stream_info.stream_url).group(
-            1
-        )
+        stream_info.codec = playlist["group_id"]
         m3u8_data = m3u8.load(stream_info.stream_url).data
         stream_info.pssh = self.get_pssh(m3u8_data)
         return stream_info
@@ -161,41 +156,35 @@ class DownloaderMusicVideo:
 
     def get_tags(
         self,
+        id_alt: str,
         itunes_page: dict,
-        m3u8_master_data: dict,
         metadata: dict,
     ):
+        metadata_itunes = self.downloader.itunes_api.get_resource(id_alt)
         tags = {
-            "artist": metadata["attributes"]["artistName"],
-            "artist_id": int(itunes_page["artistId"]),
-            "copyright": itunes_page["copyright"],
-            "date": next(
-                (
-                    session_data
-                    for session_data in m3u8_master_data["session_data"]
-                    if session_data["data_id"] == "com.apple.hls.release-date"
-                ),
-                None,
-            )["value"],
-            "genre": metadata["attributes"]["genreNames"][0],
+            "artist": metadata_itunes[0]["artistName"],
+            "artist_id": int(metadata_itunes[0]["artistId"]),
+            "copyright": itunes_page.get("copyright"),
+            "date": self.downloader.sanitize_date(metadata_itunes[0]["releaseDate"]),
+            "genre": metadata_itunes[0]["primaryGenreName"],
             "genre_id": int(itunes_page["genres"][0]["genreId"]),
             "media_type": 6,
-            "title": metadata["attributes"]["name"],
+            "storefront": int(self.downloader.itunes_api.storefront_id.split("-")[0]),
+            "title": metadata_itunes[0]["trackCensoredName"],
             "title_id": int(metadata["id"]),
         }
-        if metadata["attributes"].get("contentRating") == "clean":
-            tags["rating"] = 2
-        elif metadata["attributes"].get("contentRating") == "explicit":
+        if metadata_itunes[0]["trackExplicitness"] == "notExplicit":
+            tags["rating"] = 0
+        elif metadata_itunes[0]["trackExplicitness"] == "explicit":
             tags["rating"] = 1
         else:
-            tags["rating"] = 0
-        if itunes_page.get("collectionId"):
-            metadata_itunes = self.downloader.itunes_api.get_resource(itunes_page["id"])
+            tags["rating"] = 2
+        if len(metadata_itunes) > 1:
             album = self.downloader.apple_music_api.get_album(
                 itunes_page["collectionId"]
             )
-            tags["album"] = album["attributes"]["name"]
-            tags["album_artist"] = album["attributes"]["artistName"]
+            tags["album"] = metadata_itunes[1]["collectionCensoredName"]
+            tags["album_artist"] = metadata_itunes[1]["artistName"]
             tags["album_id"] = int(itunes_page["collectionId"])
             tags["disc"] = metadata_itunes[0]["discNumber"]
             tags["disc_total"] = metadata_itunes[0]["discCount"]
@@ -314,5 +303,5 @@ class DownloaderMusicVideo:
                 codec_audio,
             )
 
-    def get_cover_path(self, final_path: Path) -> Path:
-        return final_path.with_suffix(f".{self.downloader.cover_format.value}")
+    def get_cover_path(self, final_path: Path, file_extension: str) -> Path:
+        return final_path.with_suffix(file_extension)

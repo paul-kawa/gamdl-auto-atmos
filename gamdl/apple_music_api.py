@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import re
 import time
+import typing
 from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 
@@ -77,13 +78,38 @@ class AppleMusicApi:
         try:
             response.raise_for_status()
             response_dict = response.json()
-            assert response_dict.get("data")
+            assert response_dict.get("data") or response_dict.get("results") is not None
         except (
             requests.HTTPError,
             requests.exceptions.JSONDecodeError,
             AssertionError,
         ):
             self._raise_response_exception(response)
+
+    def get_artist(
+        self,
+        artist_id: str,
+        include: str = "albums,music-videos",
+        limit: int = 100,
+        fetch_all: bool = True,
+    ) -> dict:
+        response = self.session.get(
+            f"{self.AMP_API_URL}/v1/catalog/{self.storefront}/artists/{artist_id}",
+            params={
+                "include": include,
+                **{f"limit[{_include}]": limit for _include in include.split(",")},
+            },
+        )
+        self._check_amp_api_response(response)
+        artist = response.json()["data"][0]
+        if fetch_all:
+            for _include in include.split(","):
+                for additional_data in self._extend_api_data(
+                    artist["relationships"][_include],
+                    limit,
+                ):
+                    artist["relationships"][_include]["data"].extend(additional_data)
+        return artist
 
     def get_song(
         self,
@@ -143,13 +169,12 @@ class AppleMusicApi:
     def get_playlist(
         self,
         playlist_id: str,
-        is_library: bool = False,
         limit_tracks: int = 300,
         extend: str = "extendedAssetUrls",
-        full_playlist: bool = True,
+        fetch_all: bool = True,
     ) -> dict:
         response = self.session.get(
-            f"{self.AMP_API_URL}/v1/{'me' if is_library else 'catalog'}/{self.storefront}/playlists/{playlist_id}",
+            f"{self.AMP_API_URL}/v1/catalog/{self.storefront}/playlists/{playlist_id}",
             params={
                 "extend": extend,
                 "limit[tracks]": limit_tracks,
@@ -157,28 +182,51 @@ class AppleMusicApi:
         )
         self._check_amp_api_response(response)
         playlist = response.json()["data"][0]
-        if full_playlist:
-            playlist = self._extend_playlists_tracks(playlist, limit_tracks)
+        if fetch_all:
+            for additional_data in self._extend_api_data(
+                playlist["relationships"]["tracks"],
+                limit_tracks,
+            ):
+                playlist["relationships"]["tracks"]["data"].extend(additional_data)
         return playlist
 
-    def _extend_playlists_tracks(
+    def search(
         self,
-        playlist: dict,
-        limit_tracks: int,
+        term: str,
+        types: str = "songs,albums,artists,playlists",
+        limit: int = 25,
+        offset: int = 0,
     ) -> dict:
-        playlist_next_uri = playlist["relationships"]["tracks"].get("next")
-        while playlist_next_uri:
-            playlist_next = self._get_playlist_next(playlist_next_uri, limit_tracks)
-            playlist["relationships"]["tracks"]["data"].extend(playlist_next["data"])
-            playlist_next_uri = playlist_next.get("next")
-            time.sleep(self.WAIT_TIME)
-        return playlist
 
-    def _get_playlist_next(self, playlist_next_uri: str, limit_tracks: int) -> dict:
         response = self.session.get(
-            self.AMP_API_URL + playlist_next_uri,
+            f"{self.AMP_API_URL}/v1/catalog/{self.storefront}/search",
             params={
-                "limit[tracks]": limit_tracks,
+                "term": term,
+                "types": types,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        self._check_amp_api_response(response)
+        return response.json()["results"]
+
+    def _extend_api_data(
+        self,
+        api_response: dict,
+        limit: int,
+    ) -> typing.Generator[list[dict], None, None]:
+        next_uri = api_response.get("next")
+        while next_uri:
+            playlist_next = self._get_next_uri_response(next_uri, limit)
+            yield playlist_next["data"]
+            next_uri = playlist_next.get("next")
+            time.sleep(self.WAIT_TIME)
+
+    def _get_next_uri_response(self, next_uri: str, limit: int) -> dict:
+        response = self.session.get(
+            self.AMP_API_URL + next_uri,
+            params={
+                "limit": limit,
             },
         )
         self._check_amp_api_response(response)

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 
@@ -9,8 +11,9 @@ class UrlInfo:
 
 
 @dataclass
-class DownloadQueueItem:
-    metadata: dict = None
+class DownloadQueue:
+    playlist_attributes: dict = None
+    tracks_metadata: list[dict] = None
 
 
 @dataclass
